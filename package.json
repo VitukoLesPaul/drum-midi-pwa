@@ -9,9 +9,12 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "onnxruntime-web": "^1.18.0",
+    "@spotify/basic-pitch": "^1.0.1",
+    "@tonejs/midi": "^2.0.28",
     "midi-rw": "^1.0.0",
-    "opfs-js": "^1.0.1"
+    "onnxruntime-web": "^1.18.0",
+    "opfs-js": "^1.0.1",
+    "pleco-xa": "^2.0.5"
   },
   "devDependencies": {
     "vite": "^5.0.0",
