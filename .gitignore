@@ -1,0 +1,38 @@
+# Dependencias
+node_modules/
+
+# Salida del build
+dist/
+dist-ssr/
+
+# Caché de Vite
+.vite/
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Sistema operativo
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Variables de entorno
+.env
+.env.local
+.env.*.local
+
+# Vercel
+.vercel
