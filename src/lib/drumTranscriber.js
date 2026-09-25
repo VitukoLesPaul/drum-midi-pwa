@@ -50,7 +50,7 @@ export const DEFAULT_DRUM_OPTIONS = {
   bandActiveRatio: 2.3,
 
   // Discriminación caja vs crash desde snareWire
-  snareBodyFactorVsMean: 1.2,
+  snareBodyFactorVsMean: 2.0,
   crashMinDurationSec: 0.18,
 
   // Bandas de frecuencia (Hz)
