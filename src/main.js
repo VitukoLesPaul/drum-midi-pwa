@@ -7,7 +7,9 @@
  *   1. Subir audio (MP3/WAV/FLAC) de batería o bajo ya separados.
  *   2. Seleccionar instrumento (Batería / Bajo).
  *   3. Detectar BPM automáticamente con pleco-xa (editable por el usuario).
- *   4. Transcribir a MIDI con Basic Pitch.
+ *   4. Transcribir a MIDI:
+ *        - Bajo: Basic Pitch.
+ *        - Batería: análisis por bandas de frecuencia (drumTranscriber.js).
  *   5. Descargar el .mid listo para Logic Pro.
  */
 
@@ -31,6 +33,10 @@ import {
   transcribeWithBasicPitch,
   quantizeNotes
 } from './lib/transcriptionUtils.js';
+
+import {
+  transcribeDrums
+} from './lib/drumTranscriber.js';
 
 import {
   generateMidiFile,
@@ -334,11 +340,28 @@ async function handleTranscribe() {
   result.innerHTML = '';
 
   try {
-    progressText.textContent = 'Transcribiendo audio...';
-    const notes = await transcribeWithBasicPitch(state.audioBuffer, (p) => {
-      progressBar.style.width = `${Math.round(p * 100)}%`;
-      progressText.textContent = `Transcribiendo audio... ${Math.round(p * 100)}%`;
-    });
+    let notes;
+
+    if (state.instrumentType === 'drums') {
+      // ----- BATERÍA: análisis por bandas de frecuencia -----
+      progressText.textContent = 'Analizando batería (bandas de frecuencia)...';
+      notes = await transcribeDrums(
+        state.samples,
+        state.sampleRate,
+        {},
+        (p) => {
+          progressBar.style.width = `${Math.round(p * 100)}%`;
+          progressText.textContent = `Analizando batería... ${Math.round(p * 100)}%`;
+        }
+      );
+    } else {
+      // ----- BAJO: Basic Pitch (flujo original) -----
+      progressText.textContent = 'Transcribiendo audio con Basic Pitch...';
+      notes = await transcribeWithBasicPitch(state.audioBuffer, (p) => {
+        progressBar.style.width = `${Math.round(p * 100)}%`;
+        progressText.textContent = `Transcribiendo audio... ${Math.round(p * 100)}%`;
+      });
+    }
 
     if (!notes || notes.length === 0) {
       throw new Error('No se han detectado notas en el audio.');
@@ -355,7 +378,10 @@ async function handleTranscribe() {
       quantized,
       bpm,
       state.instrumentType,
-      { quantize: false }
+      {
+        quantize: false,
+        preservePitches: state.instrumentType === 'drums'
+      }
     );
     state.midiBlob = midiBlob;
 
