@@ -4,26 +4,16 @@
  * Transcripción de batería a notas MIDI usando análisis por bandas de
  * frecuencia (Plan A del PASO 3.7).
  *
- * Idea general:
- *   1. Trocear el audio en frames cortos con solape.
- *   2. Calcular el espectro de magnitud de cada frame con la FFT.
- *   3. Sumar la energía en bandas características de cada tambor.
- *   4. Detectar onsets (picos de energía) en cada banda con supresión de
- *      re-disparos en la cola del sonido.
- *   5. Clasificar cada onset según las bandas activas simultáneamente.
- *
- * Cambios del PASO 3.7.7b respecto a la v3 (3.7.6):
- *   - banda de hi-hat movida de [6000,12000] a [8000,14000] Hz para
- *     desenmascararla de la energía del snare (que domina 4-8 kHz).
- *   - ELIMINADA la regla "si hay snare simultáneo, no emitas hi-hat".
- *     En música real, hats y snares suenan juntos constantemente.
- *   - AÑADIDA regla específica para crash: si hay un snare en el mismo
- *     instante, no emitir crash (el HF del snare cuela en 2-9 kHz).
- *   - crashMinDurationSec subido de 0.14 a 0.18.
- *
  * Modo debug:
- *   `diagnoseDrums()` devuelve { notes, stats } con estadísticas completas.
+ *   `diagnoseDrums()` devuelve { notes, stats } con estadísticas detalladas.
  *   `transcribeDrums()` (la que usa la app) devuelve SOLO el array de notas.
+ *
+ * Añadido en 3.7.8b (diagnóstico del bombo):
+ *   - detectOnsetsInBand ahora incluye `threshold` en cada onset.
+ *   - computeAdaptiveThresholdCurve devuelve el umbral por frame.
+ *   - Si `debugKickDetail: true`, stats.kickDetail incluye la envolvente
+ *     de energía de kick muestreada + umbral adaptativo por frame, y los
+ *     onsets de kick detectados con su umbral y ratio.
  */
 
 import { magnitudeSpectrum, hannWindow, bandEnergy } from './fft.js';
@@ -63,12 +53,10 @@ export const DEFAULT_DRUM_OPTIONS = {
   snareBodyFactorVsMean: 1.2,
 
   // Duración mínima (segundos) para considerar un onset de snareWire o
-  // crash como crash. Los crashes tienen cola más larga.
+  // crash como crash.
   crashMinDurationSec: 0.18,
 
-  // Bandas de frecuencia (Hz) para cada elemento.
-  // CAMBIO 3.7.7b: hiHat ahora 8-14 kHz (antes 6-12), para no capturar
-  // el HF del snare (que está en 4-8 kHz).
+  // Bandas de frecuencia (Hz) para cada elemento
   bands: {
     kick:       [40,    100],
     snareBody:  [200,   500],
@@ -77,7 +65,7 @@ export const DEFAULT_DRUM_OPTIONS = {
     crash:      [2000,  9000]
   },
 
-  // Pitches General MIDI (canal 10) para cada sonido
+  // Pitches General MIDI (canal 10)
   gmPitches: {
     kick:      36,
     snare:     38,
@@ -86,8 +74,14 @@ export const DEFAULT_DRUM_OPTIONS = {
     crash:     49
   },
 
-  // Modo debug: si es true, transcribeDrums devuelve { notes, stats }.
-  debug: false
+  // Modo debug general
+  debug: false,
+
+  // Modo debug específico de kick (3.7.8b): si true, stats.kickDetail
+  // incluye la envolvente de energía de kick y el umbral adaptativo.
+  debugKickDetail: false,
+  // Cada cuántos frames muestrear la envolvente (10 frames ≈ 116 ms a 44.1 kHz)
+  debugSampleEveryNFrames: 10
 };
 
 // ---------------------------------------------------------------------------
@@ -108,6 +102,10 @@ function mean(values) {
   return s / values.length;
 }
 
+/**
+ * Detecta onsets (picos locales) en una señal de energía por frame.
+ * Devuelve, para cada onset, también el umbral que usó (`threshold`).
+ */
 function detectOnsetsInBand(energy, sampleRate, hopSize, options, thresholdOverride) {
   const { minIntervalMs, onsetWindowSec, decaySuppressionRatio } = options;
 
@@ -147,7 +145,8 @@ function detectOnsetsInBand(energy, sampleRate, hopSize, options, thresholdOverr
     onsets.push({
       frameIndex: i,
       timeSeconds: (i * hopSize) / sampleRate,
-      energy: energy[i]
+      energy: energy[i],
+      threshold: threshold
     });
     lastOnsetFrame = i;
 
@@ -160,6 +159,40 @@ function detectOnsetsInBand(energy, sampleRate, hopSize, options, thresholdOverr
   }
 
   return onsets;
+}
+
+/**
+ * Devuelve, para cada frame, el umbral adaptativo que se calcularía en
+ * ese frame (media + mult * desviación en ventana local).
+ * Se usa solo en modo debug.
+ */
+function computeAdaptiveThresholdCurve(energy, sampleRate, hopSize, options, thresholdOverride) {
+  const { onsetWindowSec } = options;
+
+  const onsetThresholdMult = (typeof thresholdOverride === 'number')
+    ? thresholdOverride
+    : options.onsetThresholdMult;
+
+  const hopTimeSec = hopSize / sampleRate;
+  const halfWindow = Math.max(8, Math.round((onsetWindowSec / 2) / hopTimeSec));
+
+  const thresholds = new Array(energy.length);
+  for (let i = 0; i < energy.length; i++) {
+    const lo = Math.max(0, i - halfWindow);
+    const hi = Math.min(energy.length, i + halfWindow);
+    let sum = 0;
+    let sumSq = 0;
+    const n = hi - lo;
+    for (let k = lo; k < hi; k++) {
+      sum += energy[k];
+      sumSq += energy[k] * energy[k];
+    }
+    const m = sum / n;
+    const variance = Math.max(0, sumSq / n - m * m);
+    const std = Math.sqrt(variance);
+    thresholds[i] = m + onsetThresholdMult * std;
+  }
+  return thresholds;
 }
 
 function estimateDurationSeconds(energy, onsetFrameIndex, sampleRate, hopSize, options) {
@@ -191,12 +224,6 @@ function onsetsAreSimultaneous(a, b, windowSec) {
 // API principal
 // ---------------------------------------------------------------------------
 
-/**
- * Transcribe un audio de batería a notas MIDI (en pitches General MIDI).
- *
- * Si `options.debug` es false (por defecto), devuelve el array de notas.
- * Si es true, devuelve { notes, stats }.
- */
 export async function transcribeDrums(samples, sampleRate, options = {}, onProgress) {
   const opts = {
     ...DEFAULT_DRUM_OPTIONS,
@@ -232,6 +259,7 @@ export async function transcribeDrums(samples, sampleRate, options = {}, onProgr
       snareBodyFactorVsMean: opts.snareBodyFactorVsMean,
       crashMinDurationSec: opts.crashMinDurationSec,
       hatOpenMinDurationSec: opts.hatOpenMinDurationSec,
+      decaySuppressionRatio: opts.decaySuppressionRatio,
       bands: opts.bands
     }
   } : null;
@@ -322,6 +350,39 @@ export async function transcribeDrums(samples, sampleRate, options = {}, onProgr
       crashDiscardedBySnareSimul: 0,
       crashDiscardedByShortDuration: 0
     };
+
+    // Diagnóstico específico del kick (3.7.8b)
+    if (opts.debugKickDetail) {
+      const kickThresholdCurve = computeAdaptiveThresholdCurve(kickEnergy, sampleRate, hopSize, opts);
+      const N = Math.max(1, opts.debugSampleEveryNFrames);
+      const envelope = [];
+      for (let i = 0; i < numFrames; i += N) {
+        envelope.push({
+          t: +(i * hopSize / sampleRate).toFixed(3),
+          e: +kickEnergy[i].toFixed(2),
+          thr: +kickThresholdCurve[i].toFixed(2),
+          // ¿hay un onset detectado en este frame exacto?
+          onset: false
+        });
+      }
+      // Marcar los frames que sí son onset
+      const onsetFrames = new Set(kickOnsets.map(o => o.frameIndex));
+      for (const p of envelope) {
+        // buscar el frame original a partir del tiempo
+        const fIdx = Math.round((p.t * sampleRate) / hopSize);
+        if (onsetFrames.has(fIdx)) p.onset = true;
+      }
+      stats.kickDetail = {
+        sampleEveryNFrames: N,
+        envelope,
+        onsetsDetected: kickOnsets.map(o => ({
+          t: +o.timeSeconds.toFixed(3),
+          e: +o.energy.toFixed(2),
+          thr: +o.threshold.toFixed(2),
+          ratio: +(o.energy / o.threshold).toFixed(3)
+        }))
+      };
+    }
   }
 
   // -------- 4. Emisión de notas --------
@@ -369,10 +430,7 @@ export async function transcribeDrums(samples, sampleRate, options = {}, onProgr
     }
   }
 
-  // 4c. Hi-hat (cerrado o abierto según duración)
-  // CAMBIO 3.7.7b: se ha ELIMINADO la regla "si hay snare simultáneo, no
-  // emitir hi-hat". Con la banda de hi-hat movida a 8-14 kHz, ya no captura
-  // el HF del snare. Solo descartamos si la banda está poco activa.
+  // 4c. Hi-hat
   for (const o of hiHatOnsets) {
     const hiHatActive = hiHatEnergy[o.frameIndex] > hiHatActiveThreshold;
 
@@ -403,11 +461,8 @@ export async function transcribeDrums(samples, sampleRate, options = {}, onProgr
     });
   }
 
-  // 4d. Crash desde su propia banda.
-  // CAMBIO 3.7.7b: si hay un snare en el mismo instante, NO emitimos crash.
-  // El HF del snare cuela en 2-9 kHz y estaba generando crashes falsos.
+  // 4d. Crash desde su propia banda
   for (const o of crashOnsets) {
-    // ¿Hay un snare simultáneo?
     let snareSimultaneous = false;
     for (const s of snareWireOnsets) {
       if (onsetsAreSimultaneous(o, s, opts.simultaneousWindowSec)) {
@@ -468,8 +523,14 @@ export async function transcribeDrums(samples, sampleRate, options = {}, onProgr
 }
 
 /**
- * Envoltorio de diagnóstico: siempre llama a transcribeDrums con debug true.
+ * Envoltorio de diagnóstico: llama a transcribeDrums con debug true.
+ * Extra: activa debugKickDetail si se pide.
  */
 export async function diagnoseDrums(samples, sampleRate, options = {}, onProgress) {
-  return transcribeDrums(samples, sampleRate, { ...options, debug: true }, onProgress);
+  return transcribeDrums(
+    samples,
+    sampleRate,
+    { debugKickDetail: true, ...options, debug: true },
+    onProgress
+  );
 }
