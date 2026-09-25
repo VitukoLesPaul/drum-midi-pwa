@@ -4,16 +4,14 @@
  * Transcripción de batería a notas MIDI usando análisis por bandas de
  * frecuencia (Plan A del PASO 3.7).
  *
- * Cambios del PASO 3.7.8c:
- *   - NUEVO: minEnergyRatioVsMean (umbral absoluto mínimo) para evitar
- *     falsos positivos en silencio (umbral relativo colapsaba a 0 cuando
- *     la energía era ~0, y cualquier pico disparaba un onset).
- *   - onsetThresholdMult bajado de 1.4 a 1.3 (más margen para kicks débiles).
- *   - 4b: si un onset de snareWire coincide con un onset de la banda crash
- *     y NO hay cuerpo de caja activo → se clasifica como CRASH. Esto evita
- *     que las colas de crash se conviertan en cajas falsas que luego
- *     descartan el crash real en 4d.
- *   - Modo debug: contador onsetsDiscardedByAbsoluteThreshold.
+ * Cambios del PASO 3.7.8d:
+ *   - REVERTIDO onsetThresholdMult a 1.4 (el 1.3 del 3.7.8c provocaba
+ *     un hi-hat falso tras un crash en el segundo 7 del stem).
+ *   - NUEVO: stats.snareWireDetail (si debugSnareWireDetail: true) para
+ *     diagnosticar por qué un onset de snareWire se clasifica como snare
+ *     o como crash. Incluye energías, umbrales, decisión y motivo.
+ *   - NUEVA opción debugCrashLookbackSec (0.5 por defecto): ventana para
+ *     saber si hubo un onset de crash ANTES del onset snareWire actual.
  */
 
 import { magnitudeSpectrum, hannWindow, bandEnergy } from './fft.js';
@@ -28,13 +26,12 @@ export const DEFAULT_DRUM_OPTIONS = {
 
   // Detección de onsets
   minIntervalMs: 80,
-  onsetThresholdMult: 1.3,          // 3.7.8c: bajado de 1.4
+  onsetThresholdMult: 1.4,          // 3.7.8d: revertido a 1.4
   crashOnsetThresholdMult: 1.3,
   onsetWindowSec: 1.0,
   ampPercentile: 0.9,
 
-  // Umbral absoluto mínimo (3.7.8c): la energía del pico debe superar este
-  // ratio * media_global_de_la_banda. Evita falsos positivos en silencio.
+  // Umbral absoluto mínimo
   minEnergyRatioVsMean: 0.15,
 
   // Supresión de re-disparos en la cola
@@ -76,7 +73,9 @@ export const DEFAULT_DRUM_OPTIONS = {
 
   debug: false,
   debugKickDetail: false,
-  debugSampleEveryNFrames: 10
+  debugSampleEveryNFrames: 10,
+  debugSnareWireDetail: false,
+  debugCrashLookbackSec: 0.5
 };
 
 // ---------------------------------------------------------------------------
@@ -120,7 +119,6 @@ function detectOnsetsInBand(energy, sampleRate, hopSize, options, thresholdOverr
     if (i <= suppressUntilFrame) continue;
     if (energy[i] <= energy[i - 1] || energy[i] <= energy[i + 1]) continue;
 
-    // Umbral absoluto (3.7.8c)
     if (energy[i] < minAbsoluteEnergy) {
       discardedByAbsolute++;
       continue;
@@ -258,7 +256,7 @@ export async function transcribeDrums(samples, sampleRate, options = {}, onProgr
     }
   } : null;
 
-  // 1. Espectro por frame
+  // 1. Espectro
   const frameBuffer = new Float32Array(frameSize);
   const magFrames = new Array(numFrames);
 
@@ -290,7 +288,7 @@ export async function transcribeDrums(samples, sampleRate, options = {}, onProgr
   magFrames.length = 0;
   if (onProgress) onProgress(0.9);
 
-  // 3. Onsets por banda
+  // 3. Onsets
   const kickOnsets      = detectOnsetsInBand(kickEnergy,      sampleRate, hopSize, opts);
   const snareWireOnsets = detectOnsetsInBand(snareWireEnergy, sampleRate, hopSize, opts);
   const hiHatOnsets     = detectOnsetsInBand(hiHatEnergy,     sampleRate, hopSize, opts);
@@ -339,12 +337,16 @@ export async function transcribeDrums(samples, sampleRate, options = {}, onProgr
     stats.classification = {
       snareWireAsSnare: 0,
       snareWireAsCrash: 0,
-      snareWireAsCrashBySimultaneous: 0,   // 3.7.8c
+      snareWireAsCrashBySimultaneous: 0,
       hatsDiscardedByLowActivity: 0,
       hatsDiscardedExamples: [],
       crashDiscardedBySnareSimul: 0,
       crashDiscardedByShortDuration: 0
     };
+
+    if (opts.debugSnareWireDetail) {
+      stats.snareWireDetail = [];
+    }
 
     if (opts.debugKickDetail) {
       const kickThresholdCurve = computeAdaptiveThresholdCurve(kickEnergy, sampleRate, hopSize, opts);
@@ -370,7 +372,7 @@ export async function transcribeDrums(samples, sampleRate, options = {}, onProgr
     }
   }
 
-  // 4. Emisión de notas
+  // 4. Emisión
   const notes = [];
 
   // 4a. Bombo
@@ -385,8 +387,6 @@ export async function transcribeDrums(samples, sampleRate, options = {}, onProgr
   }
 
   // 4b. Caja o crash desde snareWire
-  // 3.7.8c: si el onset coincide con un onset de la banda crash Y no hay
-  // cuerpo de caja activo → es CRASH (la cola del crash cae en snareWire).
   for (const o of snareWireOnsets) {
     const bodyAtFrame  = snareBodyEnergy[o.frameIndex];
     const crashAtFrame = crashEnergy[o.frameIndex];
@@ -395,13 +395,30 @@ export async function transcribeDrums(samples, sampleRate, options = {}, onProgr
     const crashBandActive = crashAtFrame > crashActiveThreshold;
     const isLong = dur >= opts.crashMinDurationSec;
 
-    // ¿Hay un onset de crash propio simultáneo?
+    // ¿Crash simultáneo?
     let crashSimultaneous = false;
+    let crashSimultaneousT = null;
     for (const c of crashOnsets) {
       if (onsetsAreSimultaneous(o, c, opts.simultaneousWindowSec)) {
         crashSimultaneous = true;
+        crashSimultaneousT = +c.timeSeconds.toFixed(3);
         break;
       }
+    }
+
+    // ¿Crash ANTES? (dentro de la ventana debugCrashLookbackSec)
+    let crashBefore = false;
+    let crashBeforeT = null;
+    let crashBeforeDeltaMs = null;
+    for (let i = crashOnsets.length - 1; i >= 0; i--) {
+      const c = crashOnsets[i];
+      const dt = o.timeSeconds - c.timeSeconds;
+      if (dt < 0) continue;
+      if (dt > opts.debugCrashLookbackSec) break;
+      crashBefore = true;
+      crashBeforeT = +c.timeSeconds.toFixed(3);
+      crashBeforeDeltaMs = +(dt * 1000).toFixed(0);
+      break;
     }
 
     let isCrash = false;
@@ -412,6 +429,28 @@ export async function transcribeDrums(samples, sampleRate, options = {}, onProgr
     } else if (!isSnareBody && crashBandActive && isLong) {
       isCrash = true;
       reason = 'crash-band-active-long';
+    }
+
+    if (stats && opts.debugSnareWireDetail) {
+      stats.snareWireDetail.push({
+        t: +o.timeSeconds.toFixed(3),
+        e: +o.energy.toFixed(2),
+        thr: +o.threshold.toFixed(2),
+        body: +bodyAtFrame.toFixed(2),
+        bodyThreshold: +snareBodyThreshold.toFixed(2),
+        isSnareBody,
+        crashE: +crashAtFrame.toFixed(2),
+        crashActiveThreshold: +crashActiveThreshold.toFixed(2),
+        crashBandActive,
+        durMs: +(dur * 1000).toFixed(0),
+        crashSimultaneous,
+        crashSimultaneousT,
+        crashBefore,
+        crashBeforeT,
+        crashBeforeDeltaMs,
+        decision: isCrash ? 'crash' : 'snare',
+        reason: isCrash ? reason : 'default-snare'
+      });
     }
 
     if (isCrash) {
@@ -466,7 +505,7 @@ export async function transcribeDrums(samples, sampleRate, options = {}, onProgr
     });
   }
 
-  // 4d. Crash desde su propia banda
+  // 4d. Crash propia banda
   for (const o of crashOnsets) {
     let snareSimultaneous = false;
     for (const s of snareWireOnsets) {
@@ -493,7 +532,7 @@ export async function transcribeDrums(samples, sampleRate, options = {}, onProgr
     });
   }
 
-  // 5. Deduplicación
+  // 5. Dedup
   const deduped = [];
   notes.sort((a, b) => a.startTimeSeconds - b.startTimeSeconds);
   for (const n of notes) {
@@ -525,7 +564,7 @@ export async function diagnoseDrums(samples, sampleRate, options = {}, onProgres
   return transcribeDrums(
     samples,
     sampleRate,
-    { debugKickDetail: true, ...options, debug: true },
+    { debugKickDetail: true, debugSnareWireDetail: true, ...options, debug: true },
     onProgress
   );
 }
