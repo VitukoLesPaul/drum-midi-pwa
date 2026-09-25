@@ -4,7 +4,11 @@
  * Genera archivos MIDI (SMF Tipo 1) a partir de notas transcritas.
  * 
  * - Para BAJO: usa los pitches detectados tal cual.
- * - Para BATERÍA: mapea los pitches detectados a los sonidos GM en Canal 10.
+ * - Para BATERÍA: por defecto, mapea los pitches detectados a los sonidos GM
+ *   en Canal 10 (heurística provisional). Si se pasa la opción
+ *   `preservePitches: true`, NO aplica ese mapeo y respeta los pitches
+ *   entrantes (que en ese caso deben venir ya como pitches General MIDI,
+ *   p. ej. generados por `drumTranscriber.js` en el PASO 3.7).
  * 
  * El archivo generado es compatible con Logic Pro (Drum Kit Designer con
  * Input Mapping = GM para batería).
@@ -49,6 +53,9 @@ export const GM_DRUM_MAP = {
  * @param {boolean} [options.quantize=true] - Cuantizar al grid.
  * @param {number} [options.grid=16] - Subdivisión (4=negras, 8=corcheas, 16=semicorcheas).
  * @param {string} [options.trackName] - Nombre de la pista.
+ * @param {boolean} [options.preservePitches=false] - Si es `true` y el instrumento
+ *   es batería, NO se aplica el mapeo heurístico y se usan los pitches tal cual
+ *   vienen (deben ser ya pitches General MIDI, p. ej. de `drumTranscriber.js`).
  * @returns {Blob} - Archivo MIDI listo para descargar.
  */
 export function generateMidiFile(notes, bpm, instrumentType, options = {}) {
@@ -57,7 +64,8 @@ export function generateMidiFile(notes, bpm, instrumentType, options = {}) {
     maxVelocity = 127,
     quantize = true,
     grid = 16,
-    trackName = instrumentType === 'drums' ? 'Drums' : 'Bass'
+    trackName = instrumentType === 'drums' ? 'Drums' : 'Bass',
+    preservePitches = false
   } = options;
 
   if (!Array.isArray(notes) || notes.length === 0) {
@@ -79,13 +87,14 @@ export function generateMidiFile(notes, bpm, instrumentType, options = {}) {
   const secondsPerBeat = 60 / bpm;
   const gridDuration = quantize ? secondsPerBeat / (grid / 4) : 0;
 
-  // Mapeo de pitches a notas GM si es batería.
+  // Mapeo de pitches a notas GM si es batería (heurística provisional).
   // Como Basic Pitch no está entrenado para percusión, sus pitches no
-  // corresponden a sonidos GM. Aplicamos una heurística:
-  //   - pitches graves (MIDI < 45) → bombo
-  //   - pitches medios (45-60)     → caja
-  //   - pitches agudos (> 60)      → hi-hat cerrado
-  // Esto es provisional. Mejoraremos con un análisis por bandas de frecuencia.
+  // corresponden a sonidos GM. Este mapeo solo se aplica cuando NO se pide
+  // preservar los pitches entrantes.
+  //
+  // Cuando usamos el nuevo `drumTranscriber.js` (PASO 3.7), los pitches ya
+  // vienen como General MIDI, y se llama con `preservePitches: true` para
+  // que este mapeo NO se aplique.
   const mapPitchForDrums = (pitch) => {
     if (pitch < 45) return GM_DRUM_MAP.KICK;
     if (pitch < 60) return GM_DRUM_MAP.SNARE;
@@ -124,10 +133,11 @@ export function generateMidiFile(notes, bpm, instrumentType, options = {}) {
 
     // Determina el pitch final
     let finalPitch;
-    if (instrumentType === 'drums') {
+    if (instrumentType === 'drums' && !preservePitches) {
+      // Batería con heurística (Basic Pitch): mapeo provisional.
       finalPitch = mapPitchForDrums(note.pitchMidi);
     } else {
-      // Bajo: acepta pitches de 0 a 127 tal cual
+      // Bajo (o batería con preservePitches=true): usa el pitch tal cual.
       finalPitch = Math.max(0, Math.min(127, Math.round(note.pitchMidi)));
     }
 
