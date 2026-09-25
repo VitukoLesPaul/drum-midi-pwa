@@ -13,22 +13,16 @@
  *   5. Clasificar cada onset según las bandas activas simultáneamente,
  *      con reglas de exclusión (hat vs snare, snare vs crash, etc.).
  *
- * El array de notas devuelto tiene el MISMO formato que el de Basic Pitch,
- * para que el resto del pipeline (cuantización, generación de MIDI) no
- * necesite cambiar:
+ * Modo debug (NUEVO en 3.7.7a):
+ *   La función `diagnoseDrums()` devuelve { notes, stats } con estadísticas
+ *   detalladas del proceso: onsets por banda, descartes por regla, medias de
+ *   energía, umbrales usados, etc. Se usa desde la consola del navegador
+ *   para diagnosticar sin tocar el flujo de la app.
+ *   La función `transcribeDrums()` (la que usa la app) sigue devolviendo
+ *   SOLO el array de notas, así el resto del pipeline no cambia.
  *
+ * Formato de nota:
  *   { startTimeSeconds, durationSeconds, pitchMidi, amplitude, drumType }
- *
- * Este módulo es autónomo y NO sustituye a Basic Pitch: solo se usa cuando
- * el usuario elige "Batería". El bajo sigue usando Basic Pitch sin cambios.
- *
- * Cambios del PASO 3.7.6 respecto a la v2:
- *   - banda de crash ampliada de [3000,7000] a [2000,9000].
- *   - crashMinDurationSec bajado de 0.20 a 0.14.
- *   - simultaneousWindowSec subido de 0.03 a 0.05 (más tolerante).
- *   - NUEVO: crashOnsetThresholdMult = 1.3 (más sensible para crash).
- *   - sección 4d: ya NO excluye crash si hay kick/snare simultáneo.
- *     En música real los crashes casi siempre caen con un kick o snare.
  */
 
 import { magnitudeSpectrum, hannWindow, bandEnergy } from './fft.js';
@@ -39,15 +33,15 @@ import { magnitudeSpectrum, hannWindow, bandEnergy } from './fft.js';
 
 export const DEFAULT_DRUM_OPTIONS = {
   // Análisis espectral
-  frameSize: 2048,          // potencia de 2. ~46 ms a 44.1 kHz.
-  hopSize: 512,             // ~11.6 ms a 44.1 kHz. Buen balance tiempo/frec.
+  frameSize: 2048,
+  hopSize: 512,
 
   // Detección de onsets
-  minIntervalMs: 80,        // separación mínima entre onsets en la misma banda
-  onsetThresholdMult: 1.4,  // umbral = media_local + mult * desviación_local
-  crashOnsetThresholdMult: 1.3, // umbral específico (más sensible) para crash
-  onsetWindowSec: 1.0,      // ventana para el umbral adaptativo (segundos)
-  ampPercentile: 0.9,       // percentil de energía para normalizar amplitudes
+  minIntervalMs: 80,
+  onsetThresholdMult: 1.4,
+  crashOnsetThresholdMult: 1.3,
+  onsetWindowSec: 1.0,
+  ampPercentile: 0.9,
 
   // Supresión de re-disparos en la cola de un sonido
   decaySuppressionRatio: 0.30,
@@ -82,21 +76,22 @@ export const DEFAULT_DRUM_OPTIONS = {
 
   // Pitches General MIDI (canal 10) para cada sonido
   gmPitches: {
-    kick:      36,  // C1
-    snare:     38,  // D1
-    closedHat: 42,  // F#1
-    openHat:   46,  // A#1
-    crash:     49   // C#2
-  }
+    kick:      36,
+    snare:     38,
+    closedHat: 42,
+    openHat:   46,
+    crash:     49
+  },
+
+  // Modo debug: si es true, transcribeDrums devuelve { notes, stats } en vez
+  // de solo el array de notas. main.js nunca lo activa.
+  debug: false
 };
 
 // ---------------------------------------------------------------------------
 // Utilidades internas
 // ---------------------------------------------------------------------------
 
-/**
- * Devuelve el percentil `p` (0-1) de un array de números.
- */
 function percentile(values, p) {
   if (values.length === 0) return 0;
   const sorted = Array.from(values).sort((a, b) => a - b);
@@ -104,9 +99,6 @@ function percentile(values, p) {
   return sorted[idx];
 }
 
-/**
- * Media aritmética de un array de números.
- */
 function mean(values) {
   if (values.length === 0) return 0;
   let s = 0;
@@ -114,23 +106,8 @@ function mean(values) {
   return s / values.length;
 }
 
-/**
- * Detecta onsets (picos locales) en una señal de energía por frame.
- *
- * @param {number[]} energy - Energía por frame.
- * @param {number} sampleRate
- * @param {number} hopSize
- * @param {object} options
- * @param {number} [thresholdOverride] - Si se indica, sustituye a
- *   `options.onsetThresholdMult` para esta llamada.
- * @returns {Array<{ frameIndex: number, timeSeconds: number, energy: number }>}
- */
 function detectOnsetsInBand(energy, sampleRate, hopSize, options, thresholdOverride) {
-  const {
-    minIntervalMs,
-    onsetWindowSec,
-    decaySuppressionRatio
-  } = options;
+  const { minIntervalMs, onsetWindowSec, decaySuppressionRatio } = options;
 
   const onsetThresholdMult = (typeof thresholdOverride === 'number')
     ? thresholdOverride
@@ -146,7 +123,6 @@ function detectOnsetsInBand(energy, sampleRate, hopSize, options, thresholdOverr
 
   for (let i = 1; i < energy.length - 1; i++) {
     if (i <= suppressUntilFrame) continue;
-
     if (energy[i] <= energy[i - 1] || energy[i] <= energy[i + 1]) continue;
 
     const lo = Math.max(0, i - halfWindow);
@@ -164,7 +140,6 @@ function detectOnsetsInBand(energy, sampleRate, hopSize, options, thresholdOverr
     const threshold = m + onsetThresholdMult * std;
 
     if (energy[i] < threshold) continue;
-
     if (i - lastOnsetFrame < minFramesBetween) continue;
 
     onsets.push({
@@ -185,9 +160,6 @@ function detectOnsetsInBand(energy, sampleRate, hopSize, options, thresholdOverr
   return onsets;
 }
 
-/**
- * Estima la duración de un onset en segundos.
- */
 function estimateDurationSeconds(energy, onsetFrameIndex, sampleRate, hopSize, options) {
   const peak = energy[onsetFrameIndex];
   if (peak <= 0) return options.minNoteDurationSec;
@@ -202,9 +174,6 @@ function estimateDurationSeconds(energy, onsetFrameIndex, sampleRate, hopSize, o
   return Math.max(options.minNoteDurationSec, durSec);
 }
 
-/**
- * Normaliza una energía de onset a amplitud 0-1.
- */
 function normalizeAmplitude(onsetEnergy, allEnergies, options) {
   const ref = percentile(allEnergies, options.ampPercentile);
   if (ref <= 0) return 0.7;
@@ -212,9 +181,6 @@ function normalizeAmplitude(onsetEnergy, allEnergies, options) {
   return Math.max(0.05, Math.min(1, amp));
 }
 
-/**
- * Comprueba si dos onsets son "simultáneos" (dentro de la ventana indicada).
- */
 function onsetsAreSimultaneous(a, b, windowSec) {
   return Math.abs(a.timeSeconds - b.timeSeconds) <= windowSec;
 }
@@ -226,17 +192,9 @@ function onsetsAreSimultaneous(a, b, windowSec) {
 /**
  * Transcribe un audio de batería a notas MIDI (en pitches General MIDI).
  *
- * @param {Float32Array} samples - Muestras mono.
- * @param {number} sampleRate - Frecuencia de muestreo (Hz).
- * @param {object} [options] - Opciones (ver DEFAULT_DRUM_OPTIONS).
- * @param {(progress: number) => void} [onProgress] - Callback de progreso 0-1.
- * @returns {Promise<Array<{
- *   startTimeSeconds: number,
- *   durationSeconds: number,
- *   pitchMidi: number,
- *   amplitude: number,
- *   drumType: string
- * }>>}
+ * Si `options.debug` es false (por defecto), devuelve directamente el array
+ * de notas. Si es true, devuelve { notes, stats }. main.js siempre llama con
+ * debug false, así que no se ve afectado.
  */
 export async function transcribeDrums(samples, sampleRate, options = {}, onProgress) {
   const opts = {
@@ -249,11 +207,34 @@ export async function transcribeDrums(samples, sampleRate, options = {}, onProgr
   const { frameSize, hopSize, bands, gmPitches } = opts;
 
   if (!samples || samples.length < frameSize) {
-    return [];
+    return opts.debug ? { notes: [], stats: { reason: 'audio-too-short' } } : [];
   }
 
   const numFrames = Math.floor((samples.length - frameSize) / hopSize) + 1;
+  const durationSec = samples.length / sampleRate;
   const window = hannWindow(frameSize);
+
+  // -------- Stats container (solo si debug) --------
+  const stats = opts.debug ? {
+    meta: {
+      durationSec: +durationSec.toFixed(3),
+      sampleRate,
+      frameSize,
+      hopSize,
+      numFrames
+    },
+    params: {
+      onsetThresholdMult: opts.onsetThresholdMult,
+      crashOnsetThresholdMult: opts.crashOnsetThresholdMult,
+      minIntervalMs: opts.minIntervalMs,
+      bandActiveRatio: opts.bandActiveRatio,
+      simultaneousWindowSec: opts.simultaneousWindowSec,
+      snareBodyFactorVsMean: opts.snareBodyFactorVsMean,
+      crashMinDurationSec: opts.crashMinDurationSec,
+      hatOpenMinDurationSec: opts.hatOpenMinDurationSec,
+      bands: opts.bands
+    }
+  } : null;
 
   // -------- 1. Espectro de magnitud por frame --------
   const frameBuffer = new Float32Array(frameSize);
@@ -297,16 +278,50 @@ export async function transcribeDrums(samples, sampleRate, options = {}, onProgr
   const kickOnsets      = detectOnsetsInBand(kickEnergy,      sampleRate, hopSize, opts);
   const snareWireOnsets = detectOnsetsInBand(snareWireEnergy, sampleRate, hopSize, opts);
   const hiHatOnsets     = detectOnsetsInBand(hiHatEnergy,     sampleRate, hopSize, opts);
-  // El crash usa un umbral más sensible (crashOnsetThresholdMult)
   const crashOnsets     = detectOnsetsInBand(crashEnergy,     sampleRate, hopSize, opts, opts.crashOnsetThresholdMult);
 
   const snareBodyMean = mean(snareBodyEnergy);
+  const snareWireMean = mean(snareWireEnergy);
   const hiHatMean     = mean(hiHatEnergy);
   const crashMean     = mean(crashEnergy);
 
   const snareBodyThreshold   = snareBodyMean * opts.snareBodyFactorVsMean;
   const hiHatActiveThreshold = hiHatMean * opts.bandActiveRatio;
   const crashActiveThreshold = crashMean * opts.bandActiveRatio;
+
+  if (stats) {
+    stats.meanEnergy = {
+      kick:      +kickEnergy.reduce((a,b)=>a+b,0) / numFrames,
+      snareBody: +snareBodyMean.toFixed(2),
+      snareWire: +snareWireMean.toFixed(2),
+      hiHat:     +hiHatMean.toFixed(2),
+      crash:     +crashMean.toFixed(2)
+    };
+    stats.thresholds = {
+      snareBodyThreshold:   +snareBodyThreshold.toFixed(2),
+      hiHatActiveThreshold: +hiHatActiveThreshold.toFixed(2),
+      crashActiveThreshold: +crashActiveThreshold.toFixed(2)
+    };
+    stats.onsetsDetected = {
+      kick:      kickOnsets.length,
+      snareWire: snareWireOnsets.length,
+      hiHat:     hiHatOnsets.length,
+      crash:     crashOnsets.length
+    };
+    stats.onsetsTimesFirst20 = {
+      kick:      kickOnsets.slice(0, 20).map(o => +o.timeSeconds.toFixed(3)),
+      snareWire: snareWireOnsets.slice(0, 20).map(o => +o.timeSeconds.toFixed(3)),
+      hiHat:     hiHatOnsets.slice(0, 20).map(o => +o.timeSeconds.toFixed(3)),
+      crash:     crashOnsets.slice(0, 20).map(o => +o.timeSeconds.toFixed(3))
+    };
+    stats.classification = {
+      snareWireAsSnare: 0,
+      snareWireAsCrash: 0,
+      hatsDiscardedBySnareSimul: 0,
+      hatsDiscardedByLowActivity: 0,
+      hatsDiscardedExamples: []
+    };
+  }
 
   // -------- 4. Emisión de notas --------
   const notes = [];
@@ -322,12 +337,7 @@ export async function transcribeDrums(samples, sampleRate, options = {}, onProgr
     });
   }
 
-  // 4b. Caja o crash (onsets en la banda del bordonero)
-  //   - Si la energía del cuerpo de caja (200-500 Hz) supera el umbral,
-  //     es CAJA.
-  //   - Si no la supera, y la duración es larga y la banda de crash está
-  //     activa, es CRASH.
-  //   - Si no, es CAJA por defecto (las cajas son mucho más frecuentes).
+  // 4b. Caja o crash (desde la banda snareWire)
   for (const o of snareWireOnsets) {
     const bodyAtFrame  = snareBodyEnergy[o.frameIndex];
     const crashAtFrame = crashEnergy[o.frameIndex];
@@ -335,7 +345,6 @@ export async function transcribeDrums(samples, sampleRate, options = {}, onProgr
     const dur          = estimateDurationSeconds(snareWireEnergy, o.frameIndex, sampleRate, hopSize, opts);
     const crashBandActive = crashAtFrame > crashActiveThreshold;
     const isLong = dur >= opts.crashMinDurationSec;
-
     const isCrash = !isSnareBody && crashBandActive && isLong;
 
     if (isCrash) {
@@ -346,6 +355,7 @@ export async function transcribeDrums(samples, sampleRate, options = {}, onProgr
         amplitude: normalizeAmplitude(o.energy, snareWireEnergy, opts),
         drumType: 'crash'
       });
+      if (stats) stats.classification.snareWireAsCrash++;
     } else {
       notes.push({
         startTimeSeconds: o.timeSeconds,
@@ -354,11 +364,11 @@ export async function transcribeDrums(samples, sampleRate, options = {}, onProgr
         amplitude: normalizeAmplitude(o.energy, snareWireEnergy, opts),
         drumType: 'snare'
       });
+      if (stats) stats.classification.snareWireAsSnare++;
     }
   }
 
-  // 4c. Hi-hat (cerrado o abierto según duración)
-  // Si hay un onset de snare en el mismo instante, NO emitimos hi-hat.
+  // 4c. Hi-hat
   for (const o of hiHatOnsets) {
     let snareSimultaneous = false;
     for (const s of snareWireOnsets) {
@@ -371,6 +381,18 @@ export async function transcribeDrums(samples, sampleRate, options = {}, onProgr
     const hiHatActive = hiHatEnergy[o.frameIndex] > hiHatActiveThreshold;
 
     if (snareSimultaneous || !hiHatActive) {
+      if (stats) {
+        if (snareSimultaneous) stats.classification.hatsDiscardedBySnareSimul++;
+        else stats.classification.hatsDiscardedByLowActivity++;
+        if (stats.classification.hatsDiscardedExamples.length < 10) {
+          stats.classification.hatsDiscardedExamples.push({
+            t: +o.timeSeconds.toFixed(3),
+            reason: snareSimultaneous ? 'snare-simul' : 'low-activity',
+            hiHatEnergy: +hiHatEnergy[o.frameIndex].toFixed(2),
+            threshold: +hiHatActiveThreshold.toFixed(2)
+          });
+        }
+      }
       continue;
     }
 
@@ -386,12 +408,7 @@ export async function transcribeDrums(samples, sampleRate, options = {}, onProgr
     });
   }
 
-  // 4d. Crash detectados por su propia banda.
-  // CAMBIO IMPORTANTE (3.7.6): ya NO excluimos por simultaneidad con kick o
-  // snare. En música real, los crashes casi siempre caen junto a un kick o
-  // snare (típicamente en el "1" del compás). Solo exigimos duración mínima.
-  // Los duplicados (si la banda snareWire también emitió un crash en el mismo
-  // instante) se resuelven en el paso 5 (deduplicación por pitch y tiempo).
+  // 4d. Crash desde su propia banda
   for (const o of crashOnsets) {
     const dur = estimateDurationSeconds(crashEnergy, o.frameIndex, sampleRate, hopSize, opts);
     if (dur < opts.crashMinDurationSec) continue;
@@ -405,9 +422,7 @@ export async function transcribeDrums(samples, sampleRate, options = {}, onProgr
     });
   }
 
-  // -------- 5. Eliminar duplicados casi simultáneos del mismo tipo --------
-  // Si dos bandas distintas emiten un crash en el mismo golpe (una desde
-  // snareWire y otra desde crash), nos quedamos con uno solo.
+  // -------- 5. Deduplicación --------
   const deduped = [];
   notes.sort((a, b) => a.startTimeSeconds - b.startTimeSeconds);
   for (const n of notes) {
@@ -423,7 +438,26 @@ export async function transcribeDrums(samples, sampleRate, options = {}, onProgr
     if (!isDup) deduped.push(n);
   }
 
+  if (stats) {
+    stats.emittedFinal = {
+      total: deduped.length,
+      kick:      deduped.filter(n => n.drumType === 'kick').length,
+      snare:     deduped.filter(n => n.drumType === 'snare').length,
+      crash:     deduped.filter(n => n.drumType === 'crash').length,
+      closedHat: deduped.filter(n => n.drumType === 'closedHat').length,
+      openHat:   deduped.filter(n => n.drumType === 'openHat').length
+    };
+  }
+
   if (onProgress) onProgress(1);
 
-  return deduped;
+  return opts.debug ? { notes: deduped, stats } : deduped;
+}
+
+/**
+ * Envoltorio de diagnóstico: siempre llama a transcribeDrums con debug true.
+ * Devuelve { notes, stats }.
+ */
+export async function diagnoseDrums(samples, sampleRate, options = {}, onProgress) {
+  return transcribeDrums(samples, sampleRate, { ...options, debug: true }, onProgress);
 }
