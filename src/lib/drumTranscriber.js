@@ -22,13 +22,13 @@
  * Este módulo es autónomo y NO sustituye a Basic Pitch: solo se usa cuando
  * el usuario elige "Batería". El bajo sigue usando Basic Pitch sin cambios.
  *
- * Cambios del PASO 3.7.5 respecto a la v1:
- *   - umbral de onset más bajo (1.4 en vez de 1.8) → detecta más golpes.
- *   - minIntervalMs más alto (80 en vez de 40) → menos re-disparos.
- *   - supresión de re-disparos en cola dentro de la propia banda.
- *   - discriminación hat vs snare (si hay snare en el mismo instante, no hat).
- *   - caja por defecto en caso de duda (antes se prefería crash).
- *   - banda específica de crash (3-7 kHz) con duración mínima larga.
+ * Cambios del PASO 3.7.6 respecto a la v2:
+ *   - banda de crash ampliada de [3000,7000] a [2000,9000].
+ *   - crashMinDurationSec bajado de 0.20 a 0.14.
+ *   - simultaneousWindowSec subido de 0.03 a 0.05 (más tolerante).
+ *   - NUEVO: crashOnsetThresholdMult = 1.3 (más sensible para crash).
+ *   - sección 4d: ya NO excluye crash si hay kick/snare simultáneo.
+ *     En música real los crashes casi siempre caen con un kick o snare.
  */
 
 import { magnitudeSpectrum, hannWindow, bandEnergy } from './fft.js';
@@ -45,38 +45,31 @@ export const DEFAULT_DRUM_OPTIONS = {
   // Detección de onsets
   minIntervalMs: 80,        // separación mínima entre onsets en la misma banda
   onsetThresholdMult: 1.4,  // umbral = media_local + mult * desviación_local
+  crashOnsetThresholdMult: 1.3, // umbral específico (más sensible) para crash
   onsetWindowSec: 1.0,      // ventana para el umbral adaptativo (segundos)
   ampPercentile: 0.9,       // percentil de energía para normalizar amplitudes
 
-  // Supresión de re-disparos en la cola de un sonido:
-  // tras detectar un onset, saltamos frames mientras la energía siga por
-  // encima de este ratio * energía_del_onset. Evita que un hi-hat abierto
-  // genere 2-3 notas por su cola.
+  // Supresión de re-disparos en la cola de un sonido
   decaySuppressionRatio: 0.30,
 
-  // Duración mínima de una nota MIDI (evita notas de duración 0)
+  // Duración mínima de una nota MIDI
   minNoteDurationSec: 0.04,
 
   // Discriminación hi-hat cerrado vs abierto
   hatOpenMinDurationSec: 0.18,
 
   // Ventana para considerar dos onsets "simultáneos" en bandas distintas
-  // (p. ej. snare y hat en el mismo golpe). En segundos.
-  simultaneousWindowSec: 0.03,
+  simultaneousWindowSec: 0.05,
 
-  // Umbral relativo para decidir que una banda está "activa" en un onset:
-  // la energía de la banda debe superar este ratio respecto a la media
-  // de esa banda en toda la pista.
+  // Umbral relativo para decidir que una banda está "activa" en un onset
   bandActiveRatio: 2.5,
 
-  // Discriminación caja vs crash: si la energía de cuerpo de caja (200-500 Hz)
-  // del frame del onset supera esta media por este factor, se considera caja.
-  // Si no, y la duración es larga, se considera crash.
+  // Discriminación caja vs crash desde la banda snareWire
   snareBodyFactorVsMean: 1.2,
 
   // Duración mínima (segundos) para considerar un onset de snareWire como
-  // crash. Los crashes tienen cola muy larga; las cajas no.
-  crashMinDurationSec: 0.20,
+  // crash. Los crashes tienen cola más larga que las cajas.
+  crashMinDurationSec: 0.14,
 
   // Bandas de frecuencia (Hz) para cada elemento
   bands: {
@@ -84,7 +77,7 @@ export const DEFAULT_DRUM_OPTIONS = {
     snareBody:  [200,   500],
     snareWire:  [1500,  6000],
     hiHat:      [6000,  12000],
-    crash:      [3000,  7000]
+    crash:      [2000,  9000]
   },
 
   // Pitches General MIDI (canal 10) para cada sonido
@@ -103,7 +96,6 @@ export const DEFAULT_DRUM_OPTIONS = {
 
 /**
  * Devuelve el percentil `p` (0-1) de un array de números.
- * No modifica el array de entrada.
  */
 function percentile(values, p) {
   if (values.length === 0) return 0;
@@ -125,24 +117,24 @@ function mean(values) {
 /**
  * Detecta onsets (picos locales) en una señal de energía por frame.
  *
- * Incluye supresión de re-disparos en la cola: después de detectar un onset,
- * avanza el índice mientras la energía siga por encima de
- * `decaySuppressionRatio * peak`. Así un solo golpe (especialmente hi-hat
- * abierto o crash) genera un único onset aunque su cola tenga ondulaciones.
- *
  * @param {number[]} energy - Energía por frame.
  * @param {number} sampleRate
  * @param {number} hopSize
  * @param {object} options
+ * @param {number} [thresholdOverride] - Si se indica, sustituye a
+ *   `options.onsetThresholdMult` para esta llamada.
  * @returns {Array<{ frameIndex: number, timeSeconds: number, energy: number }>}
  */
-function detectOnsetsInBand(energy, sampleRate, hopSize, options) {
+function detectOnsetsInBand(energy, sampleRate, hopSize, options, thresholdOverride) {
   const {
     minIntervalMs,
-    onsetThresholdMult,
     onsetWindowSec,
     decaySuppressionRatio
   } = options;
+
+  const onsetThresholdMult = (typeof thresholdOverride === 'number')
+    ? thresholdOverride
+    : options.onsetThresholdMult;
 
   const hopTimeSec = hopSize / sampleRate;
   const minFramesBetween = Math.max(1, Math.round((minIntervalMs / 1000) / hopTimeSec));
@@ -153,13 +145,10 @@ function detectOnsetsInBand(energy, sampleRate, hopSize, options) {
   let suppressUntilFrame = -1;
 
   for (let i = 1; i < energy.length - 1; i++) {
-    // Si estamos en zona de supresión por cola, saltamos
     if (i <= suppressUntilFrame) continue;
 
-    // Debe ser un máximo local estricto
     if (energy[i] <= energy[i - 1] || energy[i] <= energy[i + 1]) continue;
 
-    // Umbral adaptativo: media + mult * desviación en ventana local
     const lo = Math.max(0, i - halfWindow);
     const hi = Math.min(energy.length, i + halfWindow);
     let sum = 0;
@@ -176,8 +165,6 @@ function detectOnsetsInBand(energy, sampleRate, hopSize, options) {
 
     if (energy[i] < threshold) continue;
 
-    // Separación mínima entre onsets (redundante con suppressUntilFrame, pero
-    // por si el ratio de supresión es muy bajo).
     if (i - lastOnsetFrame < minFramesBetween) continue;
 
     onsets.push({
@@ -187,7 +174,6 @@ function detectOnsetsInBand(energy, sampleRate, hopSize, options) {
     });
     lastOnsetFrame = i;
 
-    // Activar supresión: avanzar mientras la energía esté por encima del ratio
     const suppressionFloor = energy[i] * decaySuppressionRatio;
     let k = i + 1;
     while (k < energy.length && energy[k] > suppressionFloor) {
@@ -200,17 +186,13 @@ function detectOnsetsInBand(energy, sampleRate, hopSize, options) {
 }
 
 /**
- * Estima la duración de un onset: número de frames consecutivos a partir del
- * onset en los que la energía se mantiene por encima de un umbral relativo
- * al pico del onset.
- *
- * @returns {number} Duración en segundos.
+ * Estima la duración de un onset en segundos.
  */
 function estimateDurationSeconds(energy, onsetFrameIndex, sampleRate, hopSize, options) {
   const peak = energy[onsetFrameIndex];
   if (peak <= 0) return options.minNoteDurationSec;
 
-  const decayFactor = 0.15; // por debajo de esto consideramos que ya "no suena"
+  const decayFactor = 0.15;
   let end = onsetFrameIndex;
   while (end + 1 < energy.length && energy[end + 1] > peak * decayFactor) {
     end++;
@@ -221,8 +203,7 @@ function estimateDurationSeconds(energy, onsetFrameIndex, sampleRate, hopSize, o
 }
 
 /**
- * Normaliza una energía de onset a un valor de amplitud 0-1, usando el
- * percentil global de la banda como referencia.
+ * Normaliza una energía de onset a amplitud 0-1.
  */
 function normalizeAmplitude(onsetEnergy, allEnergies, options) {
   const ref = percentile(allEnergies, options.ampPercentile);
@@ -237,7 +218,7 @@ function normalizeAmplitude(onsetEnergy, allEnergies, options) {
 function onsetsAreSimultaneous(a, b, windowSec) {
   return Math.abs(a.timeSeconds - b.timeSeconds) <= windowSec;
 }
-
+EOF
 // ---------------------------------------------------------------------------
 // API principal
 // ---------------------------------------------------------------------------
@@ -316,15 +297,14 @@ export async function transcribeDrums(samples, sampleRate, options = {}, onProgr
   const kickOnsets      = detectOnsetsInBand(kickEnergy,      sampleRate, hopSize, opts);
   const snareWireOnsets = detectOnsetsInBand(snareWireEnergy, sampleRate, hopSize, opts);
   const hiHatOnsets     = detectOnsetsInBand(hiHatEnergy,     sampleRate, hopSize, opts);
-  const crashOnsets     = detectOnsetsInBand(crashEnergy,     sampleRate, hopSize, opts);
+  // El crash usa un umbral más sensible (crashOnsetThresholdMult)
+  const crashOnsets     = detectOnsetsInBand(crashEnergy,     sampleRate, hopSize, opts, opts.crashOnsetThresholdMult);
 
-  // Medias globales para decisiones de "banda activa" y de caja vs crash
   const snareBodyMean = mean(snareBodyEnergy);
-  const snareWireMean = mean(snareWireEnergy);
   const hiHatMean     = mean(hiHatEnergy);
   const crashMean     = mean(crashEnergy);
 
-  const snareBodyThreshold = snareBodyMean * opts.snareBodyFactorVsMean;
+  const snareBodyThreshold   = snareBodyMean * opts.snareBodyFactorVsMean;
   const hiHatActiveThreshold = hiHatMean * opts.bandActiveRatio;
   const crashActiveThreshold = crashMean * opts.bandActiveRatio;
 
@@ -343,17 +323,16 @@ export async function transcribeDrums(samples, sampleRate, options = {}, onProgr
   }
 
   // 4b. Caja o crash (onsets en la banda del bordonero)
-  // Regla de decisión:
-  //   - Si la energía del cuerpo de caja (200-500 Hz) supera el umbral, es CAJA.
-  //   - Si no la supera:
-  //       * Si la duración es larga (>= crashMinDurationSec) Y hay energía
-  //         en la banda de crash (3-7 kHz) por encima de la media, es CRASH.
-  //       * Si no, es CAJA igualmente (caja por defecto en caso de duda).
+  //   - Si la energía del cuerpo de caja (200-500 Hz) supera el umbral,
+  //     es CAJA.
+  //   - Si no la supera, y la duración es larga y la banda de crash está
+  //     activa, es CRASH.
+  //   - Si no, es CAJA por defecto (las cajas son mucho más frecuentes).
   for (const o of snareWireOnsets) {
-    const bodyAtFrame = snareBodyEnergy[o.frameIndex];
+    const bodyAtFrame  = snareBodyEnergy[o.frameIndex];
     const crashAtFrame = crashEnergy[o.frameIndex];
-    const isSnareBody = bodyAtFrame > snareBodyThreshold;
-    const dur = estimateDurationSeconds(snareWireEnergy, o.frameIndex, sampleRate, hopSize, opts);
+    const isSnareBody  = bodyAtFrame > snareBodyThreshold;
+    const dur          = estimateDurationSeconds(snareWireEnergy, o.frameIndex, sampleRate, hopSize, opts);
     const crashBandActive = crashAtFrame > crashActiveThreshold;
     const isLong = dur >= opts.crashMinDurationSec;
 
@@ -379,11 +358,8 @@ export async function transcribeDrums(samples, sampleRate, options = {}, onProgr
   }
 
   // 4c. Hi-hat (cerrado o abierto según duración)
-  // Regla de exclusión: si hay un onset de snare en el mismo instante
-  // (± simultaneousWindowSec), NO emitimos hi-hat: probablemente sea el
-  // ruido del bordonero de la caja colándose en la banda de agudos.
+  // Si hay un onset de snare en el mismo instante, NO emitimos hi-hat.
   for (const o of hiHatOnsets) {
-    // ¿Hay un snare simultáneo?
     let snareSimultaneous = false;
     for (const s of snareWireOnsets) {
       if (onsetsAreSimultaneous(o, s, opts.simultaneousWindowSec)) {
@@ -392,7 +368,6 @@ export async function transcribeDrums(samples, sampleRate, options = {}, onProgr
       }
     }
 
-    // ¿La banda de hi-hat está realmente activa en este frame?
     const hiHatActive = hiHatEnergy[o.frameIndex] > hiHatActiveThreshold;
 
     if (snareSimultaneous || !hiHatActive) {
@@ -411,22 +386,13 @@ export async function transcribeDrums(samples, sampleRate, options = {}, onProgr
     });
   }
 
-  // 4d. Crash detectados por su propia banda (además de los que detecte
-  // el bordonero). Solo se emiten si:
-  //   - No hay un kick ni un snare ya emitido en ± simultaneousWindowSec.
-  //   - La duración es larga.
+  // 4d. Crash detectados por su propia banda.
+  // CAMBIO IMPORTANTE (3.7.6): ya NO excluimos por simultaneidad con kick o
+  // snare. En música real, los crashes casi siempre caen junto a un kick o
+  // snare (típicamente en el "1" del compás). Solo exigimos duración mínima.
+  // Los duplicados (si la banda snareWire también emitió un crash en el mismo
+  // instante) se resuelven en el paso 5 (deduplicación por pitch y tiempo).
   for (const o of crashOnsets) {
-    let conflict = false;
-    for (const k of kickOnsets) {
-      if (onsetsAreSimultaneous(o, k, opts.simultaneousWindowSec)) { conflict = true; break; }
-    }
-    if (!conflict) {
-      for (const s of snareWireOnsets) {
-        if (onsetsAreSimultaneous(o, s, opts.simultaneousWindowSec)) { conflict = true; break; }
-      }
-    }
-    if (conflict) continue;
-
     const dur = estimateDurationSeconds(crashEnergy, o.frameIndex, sampleRate, hopSize, opts);
     if (dur < opts.crashMinDurationSec) continue;
 
@@ -440,6 +406,8 @@ export async function transcribeDrums(samples, sampleRate, options = {}, onProgr
   }
 
   // -------- 5. Eliminar duplicados casi simultáneos del mismo tipo --------
+  // Si dos bandas distintas emiten un crash en el mismo golpe (una desde
+  // snareWire y otra desde crash), nos quedamos con uno solo.
   const deduped = [];
   notes.sort((a, b) => a.startTimeSeconds - b.startTimeSeconds);
   for (const n of notes) {
