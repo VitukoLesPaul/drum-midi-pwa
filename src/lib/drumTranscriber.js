@@ -4,37 +4,40 @@
  * Transcripción de batería a notas MIDI usando análisis por bandas de
  * frecuencia (Plan A del PASO 3.7).
  *
- * Modo debug:
- *   `diagnoseDrums()` devuelve { notes, stats } con estadísticas detalladas.
- *   `transcribeDrums()` (la que usa la app) devuelve SOLO el array de notas.
- *
- * Añadido en 3.7.8b (diagnóstico del bombo):
- *   - detectOnsetsInBand ahora incluye `threshold` en cada onset.
- *   - computeAdaptiveThresholdCurve devuelve el umbral por frame.
- *   - Si `debugKickDetail: true`, stats.kickDetail incluye la envolvente
- *     de energía de kick muestreada + umbral adaptativo por frame, y los
- *     onsets de kick detectados con su umbral y ratio.
+ * Cambios del PASO 3.7.8c:
+ *   - NUEVO: minEnergyRatioVsMean (umbral absoluto mínimo) para evitar
+ *     falsos positivos en silencio (umbral relativo colapsaba a 0 cuando
+ *     la energía era ~0, y cualquier pico disparaba un onset).
+ *   - onsetThresholdMult bajado de 1.4 a 1.3 (más margen para kicks débiles).
+ *   - 4b: si un onset de snareWire coincide con un onset de la banda crash
+ *     y NO hay cuerpo de caja activo → se clasifica como CRASH. Esto evita
+ *     que las colas de crash se conviertan en cajas falsas que luego
+ *     descartan el crash real en 4d.
+ *   - Modo debug: contador onsetsDiscardedByAbsoluteThreshold.
  */
 
 import { magnitudeSpectrum, hannWindow, bandEnergy } from './fft.js';
 
 // ---------------------------------------------------------------------------
-// Parámetros por defecto (todos ajustables vía `options`)
+// Parámetros por defecto
 // ---------------------------------------------------------------------------
 
 export const DEFAULT_DRUM_OPTIONS = {
-  // Análisis espectral
   frameSize: 2048,
   hopSize: 512,
 
   // Detección de onsets
   minIntervalMs: 80,
-  onsetThresholdMult: 1.4,
+  onsetThresholdMult: 1.3,          // 3.7.8c: bajado de 1.4
   crashOnsetThresholdMult: 1.3,
   onsetWindowSec: 1.0,
   ampPercentile: 0.9,
 
-  // Supresión de re-disparos en la cola de un sonido
+  // Umbral absoluto mínimo (3.7.8c): la energía del pico debe superar este
+  // ratio * media_global_de_la_banda. Evita falsos positivos en silencio.
+  minEnergyRatioVsMean: 0.15,
+
+  // Supresión de re-disparos en la cola
   decaySuppressionRatio: 0.30,
 
   // Duración mínima de una nota MIDI
@@ -43,20 +46,17 @@ export const DEFAULT_DRUM_OPTIONS = {
   // Discriminación hi-hat cerrado vs abierto
   hatOpenMinDurationSec: 0.25,
 
-  // Ventana para considerar dos onsets "simultáneos" en bandas distintas
+  // Ventana para onsets "simultáneos"
   simultaneousWindowSec: 0.05,
 
-  // Umbral relativo para decidir que una banda está "activa" en un onset
+  // Umbral de actividad por banda
   bandActiveRatio: 2.3,
 
-  // Discriminación caja vs crash desde la banda snareWire
+  // Discriminación caja vs crash desde snareWire
   snareBodyFactorVsMean: 1.2,
-
-  // Duración mínima (segundos) para considerar un onset de snareWire o
-  // crash como crash.
   crashMinDurationSec: 0.18,
 
-  // Bandas de frecuencia (Hz) para cada elemento
+  // Bandas de frecuencia (Hz)
   bands: {
     kick:       [40,    100],
     snareBody:  [200,   500],
@@ -74,18 +74,13 @@ export const DEFAULT_DRUM_OPTIONS = {
     crash:     49
   },
 
-  // Modo debug general
   debug: false,
-
-  // Modo debug específico de kick (3.7.8b): si true, stats.kickDetail
-  // incluye la envolvente de energía de kick y el umbral adaptativo.
   debugKickDetail: false,
-  // Cada cuántos frames muestrear la envolvente (10 frames ≈ 116 ms a 44.1 kHz)
   debugSampleEveryNFrames: 10
 };
 
 // ---------------------------------------------------------------------------
-// Utilidades internas
+// Utilidades
 // ---------------------------------------------------------------------------
 
 function percentile(values, p) {
@@ -102,16 +97,15 @@ function mean(values) {
   return s / values.length;
 }
 
-/**
- * Detecta onsets (picos locales) en una señal de energía por frame.
- * Devuelve, para cada onset, también el umbral que usó (`threshold`).
- */
 function detectOnsetsInBand(energy, sampleRate, hopSize, options, thresholdOverride) {
   const { minIntervalMs, onsetWindowSec, decaySuppressionRatio } = options;
 
   const onsetThresholdMult = (typeof thresholdOverride === 'number')
     ? thresholdOverride
     : options.onsetThresholdMult;
+
+  const globalMean = mean(energy);
+  const minAbsoluteEnergy = globalMean * options.minEnergyRatioVsMean;
 
   const hopTimeSec = hopSize / sampleRate;
   const minFramesBetween = Math.max(1, Math.round((minIntervalMs / 1000) / hopTimeSec));
@@ -120,10 +114,17 @@ function detectOnsetsInBand(energy, sampleRate, hopSize, options, thresholdOverr
   const onsets = [];
   let lastOnsetFrame = -Infinity;
   let suppressUntilFrame = -1;
+  let discardedByAbsolute = 0;
 
   for (let i = 1; i < energy.length - 1; i++) {
     if (i <= suppressUntilFrame) continue;
     if (energy[i] <= energy[i - 1] || energy[i] <= energy[i + 1]) continue;
+
+    // Umbral absoluto (3.7.8c)
+    if (energy[i] < minAbsoluteEnergy) {
+      discardedByAbsolute++;
+      continue;
+    }
 
     const lo = Math.max(0, i - halfWindow);
     const hi = Math.min(energy.length, i + halfWindow);
@@ -158,17 +159,12 @@ function detectOnsetsInBand(energy, sampleRate, hopSize, options, thresholdOverr
     suppressUntilFrame = k - 1;
   }
 
+  onsets.discardedByAbsolute = discardedByAbsolute;
   return onsets;
 }
 
-/**
- * Devuelve, para cada frame, el umbral adaptativo que se calcularía en
- * ese frame (media + mult * desviación en ventana local).
- * Se usa solo en modo debug.
- */
 function computeAdaptiveThresholdCurve(energy, sampleRate, hopSize, options, thresholdOverride) {
   const { onsetWindowSec } = options;
-
   const onsetThresholdMult = (typeof thresholdOverride === 'number')
     ? thresholdOverride
     : options.onsetThresholdMult;
@@ -245,15 +241,13 @@ export async function transcribeDrums(samples, sampleRate, options = {}, onProgr
   const stats = opts.debug ? {
     meta: {
       durationSec: +durationSec.toFixed(3),
-      sampleRate,
-      frameSize,
-      hopSize,
-      numFrames
+      sampleRate, frameSize, hopSize, numFrames
     },
     params: {
       onsetThresholdMult: opts.onsetThresholdMult,
       crashOnsetThresholdMult: opts.crashOnsetThresholdMult,
       minIntervalMs: opts.minIntervalMs,
+      minEnergyRatioVsMean: opts.minEnergyRatioVsMean,
       bandActiveRatio: opts.bandActiveRatio,
       simultaneousWindowSec: opts.simultaneousWindowSec,
       snareBodyFactorVsMean: opts.snareBodyFactorVsMean,
@@ -264,7 +258,7 @@ export async function transcribeDrums(samples, sampleRate, options = {}, onProgr
     }
   } : null;
 
-  // -------- 1. Espectro de magnitud por frame --------
+  // 1. Espectro por frame
   const frameBuffer = new Float32Array(frameSize);
   const magFrames = new Array(numFrames);
 
@@ -274,15 +268,11 @@ export async function transcribeDrums(samples, sampleRate, options = {}, onProgr
       frameBuffer[j] = samples[start + j] * window[j];
     }
     magFrames[i] = magnitudeSpectrum(frameBuffer);
-
-    if (onProgress && (i & 63) === 0) {
-      onProgress(0.8 * (i / numFrames));
-    }
+    if (onProgress && (i & 63) === 0) onProgress(0.8 * (i / numFrames));
   }
-
   if (onProgress) onProgress(0.8);
 
-  // -------- 2. Energía por banda y por frame --------
+  // 2. Energía por banda
   const kickEnergy      = new Array(numFrames);
   const snareBodyEnergy = new Array(numFrames);
   const snareWireEnergy = new Array(numFrames);
@@ -297,12 +287,10 @@ export async function transcribeDrums(samples, sampleRate, options = {}, onProgr
     hiHatEnergy[i]     = bandEnergy(m, sampleRate, frameSize, bands.hiHat[0],     bands.hiHat[1]);
     crashEnergy[i]     = bandEnergy(m, sampleRate, frameSize, bands.crash[0],     bands.crash[1]);
   }
-
   magFrames.length = 0;
-
   if (onProgress) onProgress(0.9);
 
-  // -------- 3. Detección de onsets por banda --------
+  // 3. Onsets por banda
   const kickOnsets      = detectOnsetsInBand(kickEnergy,      sampleRate, hopSize, opts);
   const snareWireOnsets = detectOnsetsInBand(snareWireEnergy, sampleRate, hopSize, opts);
   const hiHatOnsets     = detectOnsetsInBand(hiHatEnergy,     sampleRate, hopSize, opts);
@@ -336,6 +324,12 @@ export async function transcribeDrums(samples, sampleRate, options = {}, onProgr
       hiHat:     hiHatOnsets.length,
       crash:     crashOnsets.length
     };
+    stats.onsetsDiscardedByAbsoluteThreshold = {
+      kick:      kickOnsets.discardedByAbsolute || 0,
+      snareWire: snareWireOnsets.discardedByAbsolute || 0,
+      hiHat:     hiHatOnsets.discardedByAbsolute || 0,
+      crash:     crashOnsets.discardedByAbsolute || 0
+    };
     stats.onsetsTimesFirst20 = {
       kick:      kickOnsets.slice(0, 20).map(o => +o.timeSeconds.toFixed(3)),
       snareWire: snareWireOnsets.slice(0, 20).map(o => +o.timeSeconds.toFixed(3)),
@@ -345,13 +339,13 @@ export async function transcribeDrums(samples, sampleRate, options = {}, onProgr
     stats.classification = {
       snareWireAsSnare: 0,
       snareWireAsCrash: 0,
+      snareWireAsCrashBySimultaneous: 0,   // 3.7.8c
       hatsDiscardedByLowActivity: 0,
       hatsDiscardedExamples: [],
       crashDiscardedBySnareSimul: 0,
       crashDiscardedByShortDuration: 0
     };
 
-    // Diagnóstico específico del kick (3.7.8b)
     if (opts.debugKickDetail) {
       const kickThresholdCurve = computeAdaptiveThresholdCurve(kickEnergy, sampleRate, hopSize, opts);
       const N = Math.max(1, opts.debugSampleEveryNFrames);
@@ -360,17 +354,8 @@ export async function transcribeDrums(samples, sampleRate, options = {}, onProgr
         envelope.push({
           t: +(i * hopSize / sampleRate).toFixed(3),
           e: +kickEnergy[i].toFixed(2),
-          thr: +kickThresholdCurve[i].toFixed(2),
-          // ¿hay un onset detectado en este frame exacto?
-          onset: false
+          thr: +kickThresholdCurve[i].toFixed(2)
         });
-      }
-      // Marcar los frames que sí son onset
-      const onsetFrames = new Set(kickOnsets.map(o => o.frameIndex));
-      for (const p of envelope) {
-        // buscar el frame original a partir del tiempo
-        const fIdx = Math.round((p.t * sampleRate) / hopSize);
-        if (onsetFrames.has(fIdx)) p.onset = true;
       }
       stats.kickDetail = {
         sampleEveryNFrames: N,
@@ -385,7 +370,7 @@ export async function transcribeDrums(samples, sampleRate, options = {}, onProgr
     }
   }
 
-  // -------- 4. Emisión de notas --------
+  // 4. Emisión de notas
   const notes = [];
 
   // 4a. Bombo
@@ -400,6 +385,8 @@ export async function transcribeDrums(samples, sampleRate, options = {}, onProgr
   }
 
   // 4b. Caja o crash desde snareWire
+  // 3.7.8c: si el onset coincide con un onset de la banda crash Y no hay
+  // cuerpo de caja activo → es CRASH (la cola del crash cae en snareWire).
   for (const o of snareWireOnsets) {
     const bodyAtFrame  = snareBodyEnergy[o.frameIndex];
     const crashAtFrame = crashEnergy[o.frameIndex];
@@ -407,7 +394,25 @@ export async function transcribeDrums(samples, sampleRate, options = {}, onProgr
     const dur          = estimateDurationSeconds(snareWireEnergy, o.frameIndex, sampleRate, hopSize, opts);
     const crashBandActive = crashAtFrame > crashActiveThreshold;
     const isLong = dur >= opts.crashMinDurationSec;
-    const isCrash = !isSnareBody && crashBandActive && isLong;
+
+    // ¿Hay un onset de crash propio simultáneo?
+    let crashSimultaneous = false;
+    for (const c of crashOnsets) {
+      if (onsetsAreSimultaneous(o, c, opts.simultaneousWindowSec)) {
+        crashSimultaneous = true;
+        break;
+      }
+    }
+
+    let isCrash = false;
+    let reason = '';
+    if (!isSnareBody && crashSimultaneous) {
+      isCrash = true;
+      reason = 'simultaneous-crash';
+    } else if (!isSnareBody && crashBandActive && isLong) {
+      isCrash = true;
+      reason = 'crash-band-active-long';
+    }
 
     if (isCrash) {
       notes.push({
@@ -417,7 +422,10 @@ export async function transcribeDrums(samples, sampleRate, options = {}, onProgr
         amplitude: normalizeAmplitude(o.energy, snareWireEnergy, opts),
         drumType: 'crash'
       });
-      if (stats) stats.classification.snareWireAsCrash++;
+      if (stats) {
+        stats.classification.snareWireAsCrash++;
+        if (reason === 'simultaneous-crash') stats.classification.snareWireAsCrashBySimultaneous++;
+      }
     } else {
       notes.push({
         startTimeSeconds: o.timeSeconds,
@@ -433,7 +441,6 @@ export async function transcribeDrums(samples, sampleRate, options = {}, onProgr
   // 4c. Hi-hat
   for (const o of hiHatOnsets) {
     const hiHatActive = hiHatEnergy[o.frameIndex] > hiHatActiveThreshold;
-
     if (!hiHatActive) {
       if (stats) {
         stats.classification.hatsDiscardedByLowActivity++;
@@ -448,10 +455,8 @@ export async function transcribeDrums(samples, sampleRate, options = {}, onProgr
       }
       continue;
     }
-
     const dur = estimateDurationSeconds(hiHatEnergy, o.frameIndex, sampleRate, hopSize, opts);
     const isOpen = dur >= opts.hatOpenMinDurationSec;
-
     notes.push({
       startTimeSeconds: o.timeSeconds,
       durationSeconds: dur,
@@ -474,13 +479,11 @@ export async function transcribeDrums(samples, sampleRate, options = {}, onProgr
       if (stats) stats.classification.crashDiscardedBySnareSimul++;
       continue;
     }
-
     const dur = estimateDurationSeconds(crashEnergy, o.frameIndex, sampleRate, hopSize, opts);
     if (dur < opts.crashMinDurationSec) {
       if (stats) stats.classification.crashDiscardedByShortDuration++;
       continue;
     }
-
     notes.push({
       startTimeSeconds: o.timeSeconds,
       durationSeconds: dur,
@@ -490,7 +493,7 @@ export async function transcribeDrums(samples, sampleRate, options = {}, onProgr
     });
   }
 
-  // -------- 5. Deduplicación --------
+  // 5. Deduplicación
   const deduped = [];
   notes.sort((a, b) => a.startTimeSeconds - b.startTimeSeconds);
   for (const n of notes) {
@@ -498,10 +501,7 @@ export async function transcribeDrums(samples, sampleRate, options = {}, onProgr
     for (let i = deduped.length - 1; i >= 0; i--) {
       const prev = deduped[i];
       if (n.startTimeSeconds - prev.startTimeSeconds > opts.simultaneousWindowSec) break;
-      if (prev.pitchMidi === n.pitchMidi) {
-        isDup = true;
-        break;
-      }
+      if (prev.pitchMidi === n.pitchMidi) { isDup = true; break; }
     }
     if (!isDup) deduped.push(n);
   }
@@ -518,14 +518,9 @@ export async function transcribeDrums(samples, sampleRate, options = {}, onProgr
   }
 
   if (onProgress) onProgress(1);
-
   return opts.debug ? { notes: deduped, stats } : deduped;
 }
 
-/**
- * Envoltorio de diagnóstico: llama a transcribeDrums con debug true.
- * Extra: activa debugKickDetail si se pide.
- */
 export async function diagnoseDrums(samples, sampleRate, options = {}, onProgress) {
   return transcribeDrums(
     samples,
