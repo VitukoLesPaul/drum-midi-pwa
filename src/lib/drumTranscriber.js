@@ -10,19 +10,20 @@
  *   3. Sumar la energía en bandas características de cada tambor.
  *   4. Detectar onsets (picos de energía) en cada banda con supresión de
  *      re-disparos en la cola del sonido.
- *   5. Clasificar cada onset según las bandas activas simultáneamente,
- *      con reglas de exclusión (hat vs snare, snare vs crash, etc.).
+ *   5. Clasificar cada onset según las bandas activas simultáneamente.
  *
- * Modo debug (NUEVO en 3.7.7a):
- *   La función `diagnoseDrums()` devuelve { notes, stats } con estadísticas
- *   detalladas del proceso: onsets por banda, descartes por regla, medias de
- *   energía, umbrales usados, etc. Se usa desde la consola del navegador
- *   para diagnosticar sin tocar el flujo de la app.
- *   La función `transcribeDrums()` (la que usa la app) sigue devolviendo
- *   SOLO el array de notas, así el resto del pipeline no cambia.
+ * Cambios del PASO 3.7.7b respecto a la v3 (3.7.6):
+ *   - banda de hi-hat movida de [6000,12000] a [8000,14000] Hz para
+ *     desenmascararla de la energía del snare (que domina 4-8 kHz).
+ *   - ELIMINADA la regla "si hay snare simultáneo, no emitas hi-hat".
+ *     En música real, hats y snares suenan juntos constantemente.
+ *   - AÑADIDA regla específica para crash: si hay un snare en el mismo
+ *     instante, no emitir crash (el HF del snare cuela en 2-9 kHz).
+ *   - crashMinDurationSec subido de 0.14 a 0.18.
  *
- * Formato de nota:
- *   { startTimeSeconds, durationSeconds, pitchMidi, amplitude, drumType }
+ * Modo debug:
+ *   `diagnoseDrums()` devuelve { notes, stats } con estadísticas completas.
+ *   `transcribeDrums()` (la que usa la app) devuelve SOLO el array de notas.
  */
 
 import { magnitudeSpectrum, hannWindow, bandEnergy } from './fft.js';
@@ -61,16 +62,18 @@ export const DEFAULT_DRUM_OPTIONS = {
   // Discriminación caja vs crash desde la banda snareWire
   snareBodyFactorVsMean: 1.2,
 
-  // Duración mínima (segundos) para considerar un onset de snareWire como
-  // crash. Los crashes tienen cola más larga que las cajas.
-  crashMinDurationSec: 0.14,
+  // Duración mínima (segundos) para considerar un onset de snareWire o
+  // crash como crash. Los crashes tienen cola más larga.
+  crashMinDurationSec: 0.18,
 
-  // Bandas de frecuencia (Hz) para cada elemento
+  // Bandas de frecuencia (Hz) para cada elemento.
+  // CAMBIO 3.7.7b: hiHat ahora 8-14 kHz (antes 6-12), para no capturar
+  // el HF del snare (que está en 4-8 kHz).
   bands: {
     kick:       [40,    100],
     snareBody:  [200,   500],
     snareWire:  [1500,  6000],
-    hiHat:      [6000,  12000],
+    hiHat:      [8000,  14000],
     crash:      [2000,  9000]
   },
 
@@ -83,8 +86,7 @@ export const DEFAULT_DRUM_OPTIONS = {
     crash:     49
   },
 
-  // Modo debug: si es true, transcribeDrums devuelve { notes, stats } en vez
-  // de solo el array de notas. main.js nunca lo activa.
+  // Modo debug: si es true, transcribeDrums devuelve { notes, stats }.
   debug: false
 };
 
@@ -192,9 +194,8 @@ function onsetsAreSimultaneous(a, b, windowSec) {
 /**
  * Transcribe un audio de batería a notas MIDI (en pitches General MIDI).
  *
- * Si `options.debug` es false (por defecto), devuelve directamente el array
- * de notas. Si es true, devuelve { notes, stats }. main.js siempre llama con
- * debug false, así que no se ve afectado.
+ * Si `options.debug` es false (por defecto), devuelve el array de notas.
+ * Si es true, devuelve { notes, stats }.
  */
 export async function transcribeDrums(samples, sampleRate, options = {}, onProgress) {
   const opts = {
@@ -214,7 +215,6 @@ export async function transcribeDrums(samples, sampleRate, options = {}, onProgr
   const durationSec = samples.length / sampleRate;
   const window = hannWindow(frameSize);
 
-  // -------- Stats container (solo si debug) --------
   const stats = opts.debug ? {
     meta: {
       durationSec: +durationSec.toFixed(3),
@@ -291,7 +291,7 @@ export async function transcribeDrums(samples, sampleRate, options = {}, onProgr
 
   if (stats) {
     stats.meanEnergy = {
-      kick:      +kickEnergy.reduce((a,b)=>a+b,0) / numFrames,
+      kick:      +mean(kickEnergy).toFixed(2),
       snareBody: +snareBodyMean.toFixed(2),
       snareWire: +snareWireMean.toFixed(2),
       hiHat:     +hiHatMean.toFixed(2),
@@ -317,9 +317,10 @@ export async function transcribeDrums(samples, sampleRate, options = {}, onProgr
     stats.classification = {
       snareWireAsSnare: 0,
       snareWireAsCrash: 0,
-      hatsDiscardedBySnareSimul: 0,
       hatsDiscardedByLowActivity: 0,
-      hatsDiscardedExamples: []
+      hatsDiscardedExamples: [],
+      crashDiscardedBySnareSimul: 0,
+      crashDiscardedByShortDuration: 0
     };
   }
 
@@ -337,7 +338,7 @@ export async function transcribeDrums(samples, sampleRate, options = {}, onProgr
     });
   }
 
-  // 4b. Caja o crash (desde la banda snareWire)
+  // 4b. Caja o crash desde snareWire
   for (const o of snareWireOnsets) {
     const bodyAtFrame  = snareBodyEnergy[o.frameIndex];
     const crashAtFrame = crashEnergy[o.frameIndex];
@@ -368,26 +369,20 @@ export async function transcribeDrums(samples, sampleRate, options = {}, onProgr
     }
   }
 
-  // 4c. Hi-hat
+  // 4c. Hi-hat (cerrado o abierto según duración)
+  // CAMBIO 3.7.7b: se ha ELIMINADO la regla "si hay snare simultáneo, no
+  // emitir hi-hat". Con la banda de hi-hat movida a 8-14 kHz, ya no captura
+  // el HF del snare. Solo descartamos si la banda está poco activa.
   for (const o of hiHatOnsets) {
-    let snareSimultaneous = false;
-    for (const s of snareWireOnsets) {
-      if (onsetsAreSimultaneous(o, s, opts.simultaneousWindowSec)) {
-        snareSimultaneous = true;
-        break;
-      }
-    }
-
     const hiHatActive = hiHatEnergy[o.frameIndex] > hiHatActiveThreshold;
 
-    if (snareSimultaneous || !hiHatActive) {
+    if (!hiHatActive) {
       if (stats) {
-        if (snareSimultaneous) stats.classification.hatsDiscardedBySnareSimul++;
-        else stats.classification.hatsDiscardedByLowActivity++;
+        stats.classification.hatsDiscardedByLowActivity++;
         if (stats.classification.hatsDiscardedExamples.length < 10) {
           stats.classification.hatsDiscardedExamples.push({
             t: +o.timeSeconds.toFixed(3),
-            reason: snareSimultaneous ? 'snare-simul' : 'low-activity',
+            reason: 'low-activity',
             hiHatEnergy: +hiHatEnergy[o.frameIndex].toFixed(2),
             threshold: +hiHatActiveThreshold.toFixed(2)
           });
@@ -408,10 +403,28 @@ export async function transcribeDrums(samples, sampleRate, options = {}, onProgr
     });
   }
 
-  // 4d. Crash desde su propia banda
+  // 4d. Crash desde su propia banda.
+  // CAMBIO 3.7.7b: si hay un snare en el mismo instante, NO emitimos crash.
+  // El HF del snare cuela en 2-9 kHz y estaba generando crashes falsos.
   for (const o of crashOnsets) {
+    // ¿Hay un snare simultáneo?
+    let snareSimultaneous = false;
+    for (const s of snareWireOnsets) {
+      if (onsetsAreSimultaneous(o, s, opts.simultaneousWindowSec)) {
+        snareSimultaneous = true;
+        break;
+      }
+    }
+    if (snareSimultaneous) {
+      if (stats) stats.classification.crashDiscardedBySnareSimul++;
+      continue;
+    }
+
     const dur = estimateDurationSeconds(crashEnergy, o.frameIndex, sampleRate, hopSize, opts);
-    if (dur < opts.crashMinDurationSec) continue;
+    if (dur < opts.crashMinDurationSec) {
+      if (stats) stats.classification.crashDiscardedByShortDuration++;
+      continue;
+    }
 
     notes.push({
       startTimeSeconds: o.timeSeconds,
@@ -456,7 +469,6 @@ export async function transcribeDrums(samples, sampleRate, options = {}, onProgr
 
 /**
  * Envoltorio de diagnóstico: siempre llama a transcribeDrums con debug true.
- * Devuelve { notes, stats }.
  */
 export async function diagnoseDrums(samples, sampleRate, options = {}, onProgress) {
   return transcribeDrums(samples, sampleRate, { ...options, debug: true }, onProgress);
