@@ -51,13 +51,13 @@ export const DEFAULT_DRUM_OPTIONS = {
   minNoteDurationSec: 0.04,
 
   // Discriminación hi-hat cerrado vs abierto
-  hatOpenMinDurationSec: 0.18,
+  hatOpenMinDurationSec: 0.25,
 
   // Ventana para considerar dos onsets "simultáneos" en bandas distintas
   simultaneousWindowSec: 0.05,
 
   // Umbral relativo para decidir que una banda está "activa" en un onset
-  bandActiveRatio: 2.5,
+  bandActiveRatio: 2.3,
 
   // Discriminación caja vs crash desde la banda snareWire
   snareBodyFactorVsMean: 1.2,
