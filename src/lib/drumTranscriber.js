@@ -218,7 +218,7 @@ function normalizeAmplitude(onsetEnergy, allEnergies, options) {
 function onsetsAreSimultaneous(a, b, windowSec) {
   return Math.abs(a.timeSeconds - b.timeSeconds) <= windowSec;
 }
-EOF
+
 // ---------------------------------------------------------------------------
 // API principal
 // ---------------------------------------------------------------------------
